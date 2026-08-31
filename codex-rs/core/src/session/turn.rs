@@ -2321,13 +2321,14 @@ async fn try_run_sampling_request(
     // A provider/proxy that accepts a large context can still leave the SSE
     // request open forever. Keep unstoppable experiments recoverable while
     // preserving the normal Codex behavior when the knob is unset.
-    let timeout_seconds = std::env::var("CODEX_UNSTOPPABLE")
+    let timeout_duration = std::env::var("CODEX_UNSTOPPABLE")
         .is_ok_and(|v| v == "1")
         .then(|| std::env::var("CODEX_UNSTOPPABLE_REQUEST_TIMEOUT_SEC").ok())
         .flatten()
-        .and_then(|v| v.parse::<u64>().ok());
-    let stream_request = match timeout_seconds {
-        Some(seconds) => tokio::time::timeout(Duration::from_secs(seconds), stream_request)
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(Duration::from_secs);
+    let stream_request = match timeout_duration {
+        Some(duration) => tokio::time::timeout(duration, stream_request)
             .await
             .map_err(|_| CodexErr::new(CodexErrorDetails::RequestTimeout))?
             .map_err(CodexErr::from)?,
@@ -2379,16 +2380,20 @@ async fn try_run_sampling_request(
             codex.usage.total_tokens = field::Empty,
         );
 
-        let event = match stream
+        let next_event = stream
             .next()
             .instrument(trace_span!(parent: &handle_responses, "receiving"))
-            .or_cancel(&cancellation_token)
-            .await
-        {
+            .or_cancel(&cancellation_token);
+        let event_result = match timeout_duration {
+            Some(duration) => tokio::time::timeout(duration, next_event)
+                .await
+                .map_err(|_| CodexErr::new(CodexErrorDetails::RequestTimeout))
+                .and_then(|result| result.map_err(CodexErr::from)),
+            None => next_event.await.map_err(CodexErr::from),
+        };
+        let event = match event_result {
             Ok(event) => event,
-            Err(codex_async_utils::CancelErr::Cancelled) => {
-                break Err(CodexErr::TurnAborted);
-            }
+            Err(err) => break Err(err),
         };
 
         let event = match event {
