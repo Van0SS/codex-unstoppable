@@ -3,6 +3,7 @@ use std::collections::HashSet;
 use std::marker::PhantomData;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use crate::client::ModelClientSession;
 use crate::client_common::Prompt;
@@ -2304,7 +2305,7 @@ async fn try_run_sampling_request(
         .features
         .enabled(Feature::ConcurrentReasoningSummaries)
         && turn_context.provider.info().is_openai();
-    let mut stream = client_session
+    let stream_request = client_session
         .stream(
             prompt,
             &step_context.settings.model_info,
@@ -2316,8 +2317,23 @@ async fn try_run_sampling_request(
             &inference_trace,
         )
         .instrument(trace_span!("stream_request"))
-        .or_cancel(&cancellation_token)
-        .await??;
+        .or_cancel(&cancellation_token);
+    // A provider/proxy that accepts a large context can still leave the SSE
+    // request open forever. Keep unstoppable experiments recoverable while
+    // preserving the normal Codex behavior when the knob is unset.
+    let timeout_seconds = std::env::var("CODEX_UNSTOPPABLE")
+        .is_ok_and(|v| v == "1")
+        .then(|| std::env::var("CODEX_UNSTOPPABLE_REQUEST_TIMEOUT_SEC").ok())
+        .flatten()
+        .and_then(|v| v.parse::<u64>().ok());
+    let stream_request = match timeout_seconds {
+        Some(seconds) => tokio::time::timeout(Duration::from_secs(seconds), stream_request)
+            .await
+            .map_err(|_| CodexErr::new(CodexErrorDetails::RequestTimeout))?
+            .map_err(CodexErr::from)?,
+        None => stream_request.await.map_err(CodexErr::from)?,
+    };
+    let mut stream = stream_request?;
     let mut in_flight: FuturesOrdered<InFlightFuture<'static>> = FuturesOrdered::new();
     let mut needs_follow_up = false;
     let mut last_agent_message: Option<String> = None;
