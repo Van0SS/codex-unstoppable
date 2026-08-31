@@ -1453,6 +1453,12 @@ async fn run_sampling_request(
         Arc::clone(&turn_diff_tracker),
     );
     let max_retries = turn_context.provider.info().stream_max_retries();
+    let sampling_request_timeout = std::env::var("CODEX_UNSTOPPABLE")
+        .is_ok_and(|v| v == "1")
+        .then(|| std::env::var("CODEX_UNSTOPPABLE_REQUEST_TIMEOUT_SEC").ok())
+        .flatten()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(Duration::from_secs);
     let mut retry_state = ResponsesStreamRetryState::default();
     let mut initial_input = Some(input);
     let mut original_input = None;
@@ -1477,7 +1483,7 @@ async fn run_sampling_request(
             step_context.as_ref(),
             base_instructions.clone(),
         );
-        let err = match try_run_sampling_request(
+        let sampling_request = try_run_sampling_request(
             tool_runtime.clone(),
             Arc::clone(&sess),
             Arc::clone(&step_context),
@@ -1487,9 +1493,14 @@ async fn run_sampling_request(
             Arc::clone(&turn_diff_tracker),
             &prompt,
             cancellation_token.child_token(),
-        )
-        .await
-        {
+        );
+        let sampling_result = match sampling_request_timeout {
+            Some(duration) => tokio::time::timeout(duration, sampling_request)
+                .await
+                .map_err(|_| CodexErr::new(CodexErrorDetails::RequestTimeout))?,
+            None => sampling_request.await,
+        };
+        let err = match sampling_result {
             Ok(output) => {
                 return Ok((output, original_input.unwrap_or(prompt.input)));
             }
