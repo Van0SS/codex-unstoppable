@@ -160,6 +160,10 @@ pub(crate) async fn run_turn(
     prewarmed_client_session: Option<ModelClientSession>,
     cancellation_token: CancellationToken,
 ) -> CodexResult<Option<String>> {
+    let unstoppable_threshold = std::env::var("CODEX_UNSTOPPABLE_THRESHOLD")
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok());
+    let unstoppable = std::env::var("CODEX_UNSTOPPABLE").is_ok_and(|value| value == "1");
     // Record results from hooks that finished after the previous turn before this turn's user prompt.
     drain_async_hook_results(&sess, &turn_context, /*before_user_prompt*/ true).await;
 
@@ -169,27 +173,29 @@ pub(crate) async fn run_turn(
     // new user message are recorded. Estimate pending incoming items (context
     // diffs/full reinjection + user input) and trigger compaction preemptively
     // when they would push the thread over the compaction threshold.
-    if let Err(err) = run_pre_sampling_compact(
-        &sess,
-        &turn_context,
-        &mut client_session,
-        &cancellation_token,
-    )
-    .await
-    {
-        if matches!(err.details(), CodexErrorDetails::TurnAborted) {
-            run_hooks_and_record_inputs(&sess, &turn_context, &input, PersistContext::Standard)
+    if !unstoppable {
+        if let Err(err) = run_pre_sampling_compact(
+            &sess,
+            &turn_context,
+            &mut client_session,
+            &cancellation_token,
+        )
+        .await
+        {
+            if matches!(err.details(), CodexErrorDetails::TurnAborted) {
+                run_hooks_and_record_inputs(&sess, &turn_context, &input, PersistContext::Standard)
+                    .await;
+                return Err(err);
+            }
+            if matches!(err.details(), CodexErrorDetails::ToolCollision(_)) {
+                return Err(err);
+            }
+            let error = err.to_codex_protocol_error();
+            sess.emit_turn_error_lifecycle(turn_context.as_ref(), error.clone())
                 .await;
-            return Err(err);
+            error!("Failed to run pre-sampling compact");
+            return Ok(None);
         }
-        if matches!(err.details(), CodexErrorDetails::ToolCollision(_)) {
-            return Err(err);
-        }
-        let error = err.to_codex_protocol_error();
-        sess.emit_turn_error_lifecycle(turn_context.as_ref(), error.clone())
-            .await;
-        error!("Failed to run pre-sampling compact");
-        return Ok(None);
     }
 
     let user_input = turn_user_input(&input);
@@ -425,6 +431,8 @@ pub(crate) async fn run_turn(
                 .await;
                 let needs_follow_up = model_needs_follow_up || has_pending_input;
                 let token_limit_reached = token_status.token_limit_reached;
+                let unstoppable_threshold_reached = unstoppable_threshold
+                    .is_some_and(|threshold| token_status.active_context_tokens >= threshold);
 
                 trace!(
                     turn_id = %turn_context.sub_id,
@@ -459,7 +467,8 @@ pub(crate) async fn run_turn(
                 }
 
                 let should_roll_over = needs_follow_up
-                    && (sess.take_new_context_window_request().await || token_limit_reached);
+                    && (sess.take_new_context_window_request().await
+                        || (token_limit_reached && !unstoppable));
                 let allow_auto_compact_fallback = !should_roll_over && !token_limit_reached;
                 super::token_budget::maybe_record(
                     sess.as_ref(),
@@ -470,7 +479,7 @@ pub(crate) async fn run_turn(
                 .await;
 
                 // as long as compaction works well in getting us way below the token limit, we shouldn't worry about being in an infinite loop.
-                if should_roll_over {
+                if should_roll_over && !unstoppable {
                     if let Err(err) = run_auto_compact(
                         &sess,
                         Arc::clone(&step_context),
@@ -497,6 +506,24 @@ pub(crate) async fn run_turn(
                         return Ok(None);
                     }
                     can_drain_pending_input = !model_needs_follow_up;
+                    continue;
+                }
+
+                if unstoppable && !needs_follow_up && !unstoppable_threshold_reached {
+                    sess.record_response_item_and_emit_turn_item(
+                        &turn_context,
+                        ResponseItem::Message {
+                            id: None,
+                            role: "user".to_string(),
+                            content: vec![ContentItem::InputText {
+                                text: "Continue improving the solution. Do not stop yet."
+                                    .to_string(),
+                            }],
+                            phase: None,
+                            internal_chat_message_metadata_passthrough: None,
+                        },
+                    )
+                    .await;
                     continue;
                 }
 
