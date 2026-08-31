@@ -163,7 +163,11 @@ pub(crate) async fn run_turn(
     let unstoppable_threshold = std::env::var("CODEX_UNSTOPPABLE_THRESHOLD")
         .ok()
         .and_then(|value| value.parse::<i64>().ok());
+    let unstoppable_upper_threshold = std::env::var("CODEX_UNSTOPPABLE_UPPER_THRESHOLD")
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok());
     let unstoppable = std::env::var("CODEX_UNSTOPPABLE").is_ok_and(|value| value == "1");
+    let mut unstoppable_finish_mode = false;
     // Record results from hooks that finished after the previous turn before this turn's user prompt.
     drain_async_hook_results(&sess, &turn_context, /*before_user_prompt*/ true).await;
 
@@ -433,6 +437,8 @@ pub(crate) async fn run_turn(
                 let token_limit_reached = token_status.token_limit_reached;
                 let unstoppable_threshold_reached = unstoppable_threshold
                     .is_some_and(|threshold| token_status.active_context_tokens >= threshold);
+                let unstoppable_upper_threshold_reached = unstoppable_upper_threshold
+                    .is_some_and(|threshold| token_status.active_context_tokens >= threshold);
 
                 trace!(
                     turn_id = %turn_context.sub_id,
@@ -509,7 +515,32 @@ pub(crate) async fn run_turn(
                     continue;
                 }
 
-                if unstoppable && !needs_follow_up && !unstoppable_threshold_reached {
+                if unstoppable
+                    && unstoppable_upper_threshold_reached
+                    && !unstoppable_finish_mode
+                {
+                    unstoppable_finish_mode = true;
+                    sess.record_response_item_and_emit_turn_item(
+                        &turn_context,
+                        ResponseItem::Message {
+                            id: None,
+                            role: "user".to_string(),
+                            content: vec![ContentItem::InputText {
+                                text: "Finish the task now. Write and verify all required deliverables, then stop.".to_string(),
+                            }],
+                            phase: None,
+                            internal_chat_message_metadata_passthrough: None,
+                        },
+                    )
+                    .await;
+                    continue;
+                }
+
+                if unstoppable
+                    && !unstoppable_finish_mode
+                    && !needs_follow_up
+                    && !unstoppable_threshold_reached
+                {
                     sess.record_response_item_and_emit_turn_item(
                         &turn_context,
                         ResponseItem::Message {
