@@ -71,6 +71,12 @@ Run `codex` and select **Sign in with ChatGPT**. We recommend signing into your 
 
 You can also use Codex with an API key, but this requires [additional setup](https://developers.openai.com/codex/auth#sign-in-with-an-api-key).
 
+## Unstoppable mode
+
+Set `CODEX_UNSTOPPABLE=1` and `CODEX_UNSTOPPABLE_THRESHOLD` (for example `512000`) to
+disable automatic compaction and force continuation prompts until the active context
+reaches the threshold. The default Codex behavior is unchanged when unset.
+
 ## Docs
 
 - [**Codex Documentation**](https://developers.openai.com/codex)
