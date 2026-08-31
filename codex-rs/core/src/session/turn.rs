@@ -537,7 +537,7 @@ pub(crate) async fn run_turn(
                             id: None,
                             role: "user".to_string(),
                             content: vec![ContentItem::InputText {
-                                text: "Finish the task now. Write and verify all required deliverables, then stop.".to_string(),
+                                text: "The upper context threshold has been reached. Stop all further research, exploration, and optional improvement immediately. Using only the evidence already collected, write every required deliverable now, run only the checks needed to validate those deliverables, and then stop. Do not spend more tool calls gathering information.".to_string(),
                             }],
                             phase: None,
                             internal_chat_message_metadata_passthrough: None,
