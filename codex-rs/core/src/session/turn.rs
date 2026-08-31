@@ -421,7 +421,7 @@ pub(crate) async fn run_turn(
                 can_drain_pending_input = true;
                 // Process async hooks only after sampling and its tools have finished.
                 drain_async_hook_results(&sess, &turn_context, /*before_user_prompt*/ false).await;
-                let (has_pending_input, token_status) = async {
+                let (has_pending_input, token_status, estimated_context_tokens) = async {
                     let has_pending_input =
                         sess.input_queue.has_pending_input(&sess.active_turn).await;
                     let token_status = super::context_window::context_window_token_status(
@@ -429,16 +429,27 @@ pub(crate) async fn run_turn(
                         turn_context.as_ref(),
                     )
                     .await;
-                    (has_pending_input, token_status)
+                    let estimated_context_tokens = sess
+                        .get_estimated_token_count(turn_context.as_ref())
+                        .await;
+                    (has_pending_input, token_status, estimated_context_tokens)
                 }
                 .instrument(trace_span!("run_turn.collect_post_sampling_state"))
                 .await;
                 let needs_follow_up = model_needs_follow_up || has_pending_input;
+                // Some OpenAI-compatible proxies omit usage metadata. In that case
+                // provider-reported active_context_tokens can remain zero even as
+                // the persisted history grows. Use the local history estimate as
+                // a conservative fallback for unstoppable thresholds.
+                let effective_context_tokens = std::cmp::max(
+                    token_status.active_context_tokens,
+                    estimated_context_tokens.unwrap_or_default(),
+                );
                 let token_limit_reached = token_status.token_limit_reached;
                 let unstoppable_threshold_reached = unstoppable_threshold
-                    .is_some_and(|threshold| token_status.active_context_tokens >= threshold);
+                    .is_some_and(|threshold| effective_context_tokens >= threshold);
                 let unstoppable_upper_threshold_reached = unstoppable_upper_threshold
-                    .is_some_and(|threshold| token_status.active_context_tokens >= threshold);
+                    .is_some_and(|threshold| effective_context_tokens >= threshold);
 
                 trace!(
                     turn_id = %turn_context.sub_id,
